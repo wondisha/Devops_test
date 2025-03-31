@@ -1,0 +1,706 @@
+<#
+.SYNOPSIS
+SQLGuardian - A PowerShell script for monitoring SQL Server security and performance.
+
+.DESCRIPTION
+SQLGuardian is a comprehensive PowerShell script designed to monitor SQL Server instances for security and performance issues. 
+It includes functions to check for failed logins, encryption status, performance issues, and to invoke a Python script for anomaly detection.
+
+.PARAMETER ServerName
+Specifies the name of the SQL Server instance to monitor. Default is "techpc".
+
+.PARAMETER Interactive
+Switch to enable interactive mode, allowing users to input commands and receive real-time feedback.
+
+.FUNCTIONS
+Check-FailedLogins
+    Checks the SQL Server error log for failed login attempts within a specified time window and logs the results to a CSV file.
+
+Check-EncryptionStatus
+    Checks the encryption status of user databases and alerts if any databases are not encrypted.
+
+Check-Performance
+    Checks for slow queries and missing indexes with high impact on performance.
+
+Invoke-PythonScript
+    Invokes a Python script for anomaly detection using a pre-trained model.
+
+Start-SQLGuardian
+    Starts the SQLGuardian monitoring process. In interactive mode, it allows users to input commands. In non-interactive mode, it performs scheduled checks and sends alerts via email.
+
+.EXAMPLE
+# Start SQLGuardian in non-interactive mode
+.\SQLGuardian.ps1
+
+# Start SQLGuardian in interactive mode
+.\SQLGuardian.ps1 -Interactive
+
+.NOTES
+- Ensure the SQL Server PowerShell module is installed and configured.
+- Update the SMTP configuration for email alerts.
+- Ensure Python and required libraries are installed for anomaly detection.
+
+.AUTHOR
+Wondi W
+#>
+
+param (
+      [string] $centralDBserver = "capsqldbat16v01", #Server hosting the serverName table
+      [string]$centralDBname ="InstanceMonitor",            #Database containing the servername table
+      [switch] $interactive
+)
+
+<#param (
+    [string[]]$ServerList = @("capsqldbat16v01"),  # Default list of servers
+    [switch]$Interactive
+)
+#>
+# Define global variables
+$script:alerts = @()
+$smtpServer = "ozk-com.mail.protection.outlook.com"
+$smtpPort = 25
+$smtpUsername = "wondi.woldetensay@ozk.com"
+$smtpPassword = "vrwt qafv lpek kcfa"
+$emailTo = "wondi.woldetensay@ozk.com"
+$emailFrom = "wondi.woldetensay@ozk.com"
+$logDir ="\\boodata\DepartmentShares\EDS\DBA\Wondi\AuditLogs"
+
+if (-not (test-path $logDir)) {
+   New-Item -ItemType Directory -path $logdir -force |Out-Null
+   }
+
+#ineratctive session log file
+$interactiveLogFile ="$logDir\SQLGuardian_interactive_$(Get-Date -Format 'yyyymmdd_HHmmss').log"
+
+#Function to get server List from database
+function get-serverlistfromDB {
+     param (
+       [string]$server,
+       [string]$Database
+)
+$query = "Select Instance from dbo.instances ;"
+   try {
+       $servers =invoke-sqlcmd -serverInstance $server -Database $Database -Query $query -TrustServerCertificate -ErrorAction stop
+       return $servers | Select-Object -expandproperty $servername
+  } catch {
+       $erroemessage = "Error retrieving server list from database : $($_.Exception.Message)"
+       write-host $erroemessage
+       Add-Content -PassThru $interactiveLogFile -value $errormessage 
+       Write-Host "Falling back to default server list: @ ('CAP2016SQL1-TES\AOSQL2017TEST03','capsqldbat16v01')"
+       return @('CAP2016SQL1-TES\AOSQL2017TEST03','capsqldbat16v01') # Fallback list
+  }
+}
+# Include existing functions (Check-FailedLogins, Check-EncryptionStatus, Check-Performance, Invoke-PythonScript)
+function Check-FailedLogins {
+    param (
+        [string]$ServerName,
+        [int]$TimeWindowMinutes = 15
+    )
+    $queryc= "Exec sp_readerrorlog 0 ,1,'Login failed';"
+    try {
+        #$query = "EXEC sp_readerrorlog 0, 1, 'Login failed';"
+        $errorLog = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $query -TrustServerCertificate -ErrorAction Stop
+
+        if ($errorLog -and $errorLog.Count -gt 0) {
+            $script:alerts += "[$ServerName] Info: Found $($errorLog.Count) 'Login failed' entries in the error log."
+            $rawLogs = $errorLog | ForEach-Object { "$($_.LogDate) - $($_.Text)" }
+            Write-Output "[$ServerName] Debug: Raw failed login entries:"
+            Write-Output ($rawLogs -join "`n")
+        } else {
+            $script:alerts += "[$ServerName] Info: No 'Login failed' entries found in the error log."
+        }
+    } catch {
+        $script:alerts += "[$ServerName] Debug: Failed to read error log. Error: $($_.Exception.Message)"
+    }
+
+    # CSV logging with enhanced validation
+    $csvData = foreach ($log in $errorLog) {
+        if ($log.Text -match "Login failed for user '?(.*?)(?:'| Reason)") {
+            $user = $matches[1].TrimEnd(';')
+            $logTime = Get-Date $log.LogDate -Format "MM/dd/yyyy HH:mm:ss"
+            $reason = $log.Text -replace ".*Reason: (.*?)(\.| \[CLIENT:.*\])", '$1'
+            $client = $log.Text -replace ".*\[CLIENT: (.*?)\]", '$1'
+            if ($logTime -and $user -and $reason -and $client -and ($logTime -match "^\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2}$")) {
+                [PSCustomObject]@{
+                    Timestamp  = $logTime
+                    User       = $user
+                    Reason     = $reason
+                    ServerName = $ServerName
+                    ClientIP   = $client
+                }
+            } else {
+                Write-Host "[$ServerName] Warning: Skipping invalid log entry with missing or malformed fields: Timestamp='$logTime', User='$user', Reason='$reason', ClientIP='$client'"
+            }
+        }
+    }
+    if ($csvData) {
+        $existingData = if (Test-Path $logFile) { Import-Csv $logFile } else { @() }
+        $newData = $csvData | Where-Object {
+            $entry = $_
+            -not ($existingData | Where-Object {
+                $_.Timestamp -eq $entry.Timestamp -and $_.User -eq $entry.User -and $_.ServerName -eq $entry.ServerName
+            })
+        }
+        if ($newData) {
+            $newData | Export-Csv -Path $logFile -Append -NoTypeInformation -Force
+            [System.IO.File]::WriteAllLines($logFile, (Get-Content $logFile))
+            Write-Host "[$ServerName] Debug: Wrote $($newData.Count) new rows to $logFile"
+            Start-Sleep -Milliseconds 1000
+        } else {
+            Write-Host "[$ServerName] Debug: No new rows to write to $logFile"
+        }
+    }
+}
+
+function Check-EncryptionStatus {
+    param (
+        [string]$ServerName
+    )
+    $query = @"
+    SELECT 
+        name, 
+        is_encrypted
+    FROM sys.databases
+    WHERE is_encrypted = 0 
+    AND name NOT IN ('tempdb', 'master', 'model', 'msdb')
+"@
+    try {
+        $unencryptedDbs = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $query -TrustServerCertificate -ErrorAction Stop
+        if ($null -eq $unencryptedDbs -or $unencryptedDbs.Count -eq 0) {
+            $script:alerts += "[$ServerName] Info: All user databases are encrypted or no unencrypted databases detected."
+            return
+        }
+        foreach ($db in $unencryptedDbs) {
+            $script:alerts += "[$ServerName] Security Alert: Database '$($db.name)' is not encrypted. Recommend enabling Transparent Data Encryption (TDE)."
+        }
+    } catch {
+        $script:alerts += "[$ServerName] Warning: Unable to check encryption status. Check permissions. Error: $($_.Exception.Message)"
+    }
+}
+
+function Check-Performance {
+    param (
+        [string]$ServerName
+    )
+    $slowQuery = @"
+    SELECT TOP 20
+        t.text AS query_text,
+        qs.execution_count,
+        qs.total_worker_time / 1000 AS total_worker_time_ms,
+        qs.total_worker_time / qs.execution_count / 1000 AS avg_worker_time_ms
+    FROM sys.dm_exec_query_stats qs
+    CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) t
+    ORDER BY qs.total_worker_time DESC;
+"@
+    $indexQuery = @"
+    SELECT 
+        DB_NAME(mid.database_id) AS database_name,
+        migs.avg_user_impact,
+        mid.statement AS table_name,
+        mid.equality_columns,
+        mid.inequality_columns
+    FROM sys.dm_db_missing_index_group_stats migs
+    JOIN sys.dm_db_missing_index_groups mig ON migs.group_handle = mig.index_group_handle
+    JOIN sys.dm_db_missing_index_details mid ON mig.index_handle = mid.index_handle
+    JOIN sys.databases d ON mid.database_id = d.database_id
+    WHERE migs.avg_user_impact > 50
+    AND d.name NOT IN ('master', 'model', 'msdb', 'tempdb')
+    ORDER BY migs.avg_user_impact DESC;
+"@
+    $cpuQuery = @"
+    SELECT 
+        AVG(CAST(record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'int') AS DECIMAL(5,2))) AS SystemIdlePercent,
+        AVG(CAST(record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]', 'int') AS DECIMAL(5,2))) AS SQLProcessUtilizationPercent
+    FROM (
+        SELECT 
+            DATEADD(MILLISECOND,rb.timestamp,si.sqlserver_start_time) as Actual_timestamp,
+            CONVERT(XML, rb.record) AS record
+        FROM sys.dm_os_ring_buffers rb
+        CROSS JOIN sys.dm_os_sys_info si
+        where rb.ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR'
+        AND rb.record LIKE '%<SystemHealth>%'
+        
+    ) AS RingBuffer
+    WHERE Actual_timestamp > DATEADD(MINUTE, -15, GETDATE());
+"@
+
+    try {
+        $slowQueries = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $slowQuery -TrustServerCertificate -ErrorAction Stop
+        if ($null -eq $slowQueries) {
+            $script:alerts += "[$ServerName] Warning: Unable to check slow queries. Check VIEW SERVER STATE permission."
+            return
+        }
+        foreach ($query in $slowQueries) {
+            if ($query.avg_worker_time_ms -gt 20) {
+                $script:alerts += "[$ServerName] Performance Alert: Query '$($query.query_text.Substring(0, [Math]::Min(50, $query.query_text.Length)))...' " +
+                           "ran $($query.execution_count) times, total CPU time: $($query.total_worker_time_ms)ms, " +
+                           "avg CPU time: $($query.avg_worker_time_ms)ms. Consider optimization."
+            }
+        }
+    } catch {
+        $script:alerts += "[$ServerName] Debug: Failed to query slow queries. Error: $($_.Exception.Message)"
+    }
+
+    try {
+        $missingIndexes = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $indexQuery -TrustServerCertificate -ErrorAction Stop
+        if ($missingIndexes -and $missingIndexes.Count -gt 0) {
+            foreach ($index in $missingIndexes) {
+                $script:alerts += "[$ServerName] Performance Alert: Missing index in database '$($index.database_name)' on '$($index.table_name)' with impact $($index.avg_user_impact)%. " +
+                           "Consider indexing columns: $($index.equality_columns), $($index.inequality_columns)."
+            }
+        } else {
+            $script:alerts += "[$ServerName] Info: No missing indexes detected with impact > 50% in any user database."
+        }
+    } catch {
+        $script:alerts += "[$ServerName] Debug: Failed to query missing indexes. Error: $($_.Exception.Message)"
+    }
+
+    try {
+        $cpuUsage = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $cpuQuery -TrustServerCertificate -ErrorAction Stop
+        if ($cpuUsage) {
+            $script:alerts += "[$ServerName] Info: CPU Usage (last 15 minutes) on {$ServerName}{:}"
+            $script:alerts += "[$ServerName] Info: System Idle: $($cpuUsage.SystemIdlePercent)%"
+            $script:alerts += "[$ServerName] Info: SQL Process Utilization: $($cpuUsage.SQLProcessUtilizationPercent)%"
+            if ($cpuUsage.SQLProcessUtilizationPercent -gt 80) {
+                $script:alerts += "[$ServerName] Warning: High SQL Server CPU usage detected (> 80%). Investigate active queries and server workload."
+            }
+        } else {
+            $script:alerts += "[$ServerName] Warning: No valid CPU usage data available for the last 15 minutes."
+        }
+    } catch {
+        $errormessage= " Failed to retrieve CPU usage. Possible invalid timestamp data. Error: $($_.Exception.Message)"
+        $script:alerts +="[$ServerName] Warning: $errormessage"
+        Write-Host   "[$ServerName] Debug SQL Error Details: $($_.Exception.InnerException.Message)"
+        Write-Host   "[$ServerName] Info: Skipping CPU Usage due to error."
+    }
+}
+
+function Invoke-PythonScript {
+    param (
+        [string]$Script,
+        [string]$ServerName
+    )
+    # Use full path to python.exe (adjust based on your installation)
+    $pythonPath = "C:\Python39\python.exe"  # Update this path
+    if (-not (Test-Path $pythonPath)) {
+        Write-Host "[$ServerName] Error: Python executable not found at $pythonPath. Please update the path in the script."
+        return $null
+    }
+
+    # Check if python command is available
+    try {
+        $pythonVersion = & $pythonPath --version 2>&1
+        Write-Host "[$ServerName] Debug: Python version: $pythonVersion"
+    } catch {
+        Write-Host "[$ServerName] Error: Failed to execute Python. Error: $($_.Exception.Message)"
+        return $null
+    }
+
+    $tempFile = "\\boodata\DepartmentShares\EDS\DBA\Wondi\AuditLogs\LastPythonScript_$ServerName.py"
+    [System.IO.File]::WriteAllText($tempFile, $Script, [System.Text.Encoding]::UTF8)
+    try {
+        $result = & $pythonPath $tempFile 2>&1
+        return $result
+    } catch {
+        Write-Host "[$ServerName] Error: Failed to execute Python script. Error: $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Start-SQLGuardian {
+    param (
+        [switch]$Interactive
+    )
+
+    #Get server list from database
+    $serverList = Get-serverListfromDB -server $centralDBserver -Database $centralDBname
+    $selectedServers =$ServerList # Default to all servers
+
+    if ($Interactive) {
+       $message = "Welcome to SQLGuardian Interactive Mode! Monitoring servers: $($ServerList -join ', '). Type 'exit' to quit."
+       write-host $message 
+       add-content -Path $instactiveLogFile -Value $message
+       switch -wildcard ($command.ToLower()) {
+           " Select servers" {
+              $message = "Available Servers: $($ServerList -join ' ,')"
+              Write-Host $message
+              add-content -path $instactiveLogFile -value $message
+              $input = read-host "Enter server names (comma-separated, or 'all' fopr all servers)"
+              if ($input -eq 'all') {
+                 $selectedServers =$serverList
+             } else {
+                  $selectedServers = $input -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $ServerList -contains $_ }
+                  if (-not $selectedServers) {
+                      $message = "No valid servers selected.Using all servers."
+                      write-host $message
+                      Add-Content -Path $interactiveLogFile -value $message
+                      $selectedservers = $serverList 
+                  }
+             }
+             $message = "Selected Servers: $($selectedServers -join ' , ')"
+             Write-Host $message 
+             Add-Content -Path $interactiveLogFile -Value $message
+             }
+
+        <#while ($true) {
+            $command = Read-Host "`nEnter command (e.g., 'what is the missing index?', 'show recent logins', 'check deadlocks', 'check blocking', 'check performance issues', 'exit')"
+            switch -Wildcard ($command.ToLower()) {
+              "Select servers" {
+                 Write-Host "Available servers: $($ServerList -join ',')"
+                 $input = Read-Host "Enter server names (comma-separated,or 'all' for all servers)"
+                 if ($input -eq 'all') {
+                    $selectedServers =$ServerList
+                  } else {
+                      $selectedServers = $input -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $ServerList -contains $_ }
+                      if (-not $selectedServers) {
+                           Write-Host "No valid servers selected.Using all servers."
+                           $selectedServers = $ServerList
+                        }
+                    }
+                    Write-Host "Selected servers: $($selectedServers -join ',')"   #>
+                 
+                "what is the missing index?" {
+                    foreach ($ServerName in $ServerList) {
+                        Write-Host "`nChecking missing indexes on $ServerName..."
+                        $query = @"
+                        SELECT 
+                            DB_NAME(mid.database_id) AS database_name,
+                            migs.avg_user_impact,
+                            mid.statement AS table_name,
+                            mid.equality_columns,
+                            mid.inequality_columns
+                        FROM sys.dm_db_missing_index_group_stats migs
+                        JOIN sys.dm_db_missing_index_groups mig ON migs.group_handle = mig.index_group_handle
+                        JOIN sys.dm_db_missing_index_details mid ON mig.index_handle = mid.index_handle
+                        JOIN sys.databases d ON mid.database_id = d.database_id
+                        WHERE migs.avg_user_impact > 50
+                        AND d.name NOT IN ('master', 'model', 'msdb', 'tempdb')
+                        ORDER BY migs.avg_user_impact DESC;
+"@
+                        try {
+                            $missingIndexes = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $query -TrustServerCertificate -ErrorAction Stop
+                            if ($missingIndexes) {
+                                $missingIndexes | ForEach-Object {
+                                    Write-Host "Missing index in database '$($_.database_name)' on '$($_.table_name)' with impact $($_.avg_user_impact)%. Columns: $($_.equality_columns), $($_.inequality_columns)"
+                                }
+                            } else {
+                                Write-Host "No missing indexes detected with impact > 50% in any user database on $ServerName."
+                            }
+                        } catch {
+                            Write-Host "[$ServerName] Error: Failed to check missing indexes. Error: $($_.Exception.Message)"
+                        }
+                    }
+                }
+                "show recent logins" {
+                    foreach ($ServerName in $ServerList) {
+                        Write-Host "`nChecking recent logins on $ServerName..."
+                        Check-FailedLogins -ServerName $ServerName -TimeWindowMinutes 15
+                        $currentTime = Get-Date
+                        Write-Host "[$ServerName] Debug: Current time is $currentTime"
+                        $logFile = "\\boodata\DepartmentShares\EDS\DBA\Wondi\AuditLogs\FailedLogins_$ServerName.csv"
+                        if (-not (Test-Path $logFile)) {
+                            Write-Host "[$ServerName] Info: $logFile does not exist. No login data to display."
+                            continue
+                        }
+                        $csvContent = Import-Csv $logFile
+                        if (-not $csvContent) {
+                            Write-Host "[$ServerName] Info: $logFile is empty. No login data to display."
+                            continue
+                        }
+                        Write-Host "[$ServerName] Debug: CSV content count: $($csvContent.Count)"
+                        $recentLogins = @()
+                        $csvContent | ForEach-Object {
+                            try {
+                                $timestamp = [datetime]::ParseExact($_.Timestamp, "MM/dd/yyyy HH:mm:ss", [System.Globalization.CultureInfo]::InvariantCulture)
+                                $cutoffTime = $currentTime.AddMinutes(-15)
+                                Write-Host "[$ServerName] Debug: Checking timestamp $($_.Timestamp) (parsed: $timestamp) against cutoff $cutoffTime"
+                                if ($timestamp -gt $cutoffTime) {
+                                    $_
+                                }
+                            } catch {
+                                Write-Host "[$ServerName] Warning: Skipping invalid timestamp '$($_.Timestamp)' in CSV. Error: $_"
+                            }
+                        }
+                        write-host "Debug: ServerName is '$ServerName'"
+                        if ($recentLogins.Count -gt 0) {
+                            Write-Host "Recent logins (last 15 minutes) on ${ServerName}:"
+                            $recentLogins | Format-Table -Property Timestamp, User, Reason, ClientIP -AutoSize
+                        } else {
+                            Write-Host "No recent logins detected in the last 15 minutes on $ServerName."
+                        }
+                    }
+                }
+                "check deadlocks" {
+                    foreach ($ServerName in $ServerList) {
+                        Write-Host "`nChecking deadlocks on {$ServerName}..."
+                        $deadlockQuery = @"
+                        DECLARE @xml XML;
+                        SELECT @xml = target_data
+                        FROM sys.dm_xe_session_targets xt
+                        JOIN sys.dm_xe_sessions xs ON xs.address = xt.event_session_address
+                        WHERE xs.name = 'system_health'
+                        AND xt.target_name = 'ring_buffer';
+                        SELECT 
+                            XEventData.XEvent.value('(data/value)[1]', 'NVARCHAR(MAX)') AS deadlock_graph,
+                            XEventData.XEvent.value('@timestamp', 'DATETIME') AS event_time
+                        FROM @xml.nodes('//RingBufferTarget/event[@name="xml_deadlock_report"]') AS XEventData(XEvent)
+                        ORDER BY event_time DESC;
+"@
+                        try {
+                            $deadlocks = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $deadlockQuery -TrustServerCertificate -ErrorAction Stop
+                            if ($deadlocks -and $deadlocks.Count -gt 0) {
+                                $deadlock_count = $deadlocks.Count
+                                Write-Host "Found $deadlock_count deadlock(s) on {$ServerName}:"
+                                $deadlocks | ForEach-Object {
+                                    Write-Host "Deadlock at $($_.event_time):"
+                                    Write-Host "Deadlock Graph (XML excerpt): $($_.deadlock_graph.Substring(0, [Math]::Min(100, $_.deadlock_graph.Length)))..."
+                                    Write-Host "Full deadlock graph saved to \\boodata\DepartmentShares\EDS\DBA\Wondi\AuditLogs\Deadlock_$ServerName_$($_.event_time.ToString('yyyyMMdd_HHmmss')).xml"
+                                    $_.deadlock_graph | Out-File -FilePath "\\boodata\DepartmentShares\EDS\DBA\Wondi\AuditLogs\Deadlock_$ServerName_$($_.event_time.ToString('yyyyMMdd_HHmmss')).xml"
+                                }
+                            } else {
+                                Write-Host "No recent deadlocks detected on $ServerName."
+                            }
+                        } catch {
+                            Write-Host "[$ServerName] Error: Failed to check deadlocks. Ensure system_health session is running. Error: $($_.Exception.Message)"
+                        }
+                    }
+                }
+                "check blocking" {
+                    foreach ($ServerName in $ServerList) {
+                        Write-Host "`nChecking blocking sessions on $ServerName..."
+                        $blockingQuery = @"
+                        SELECT 
+                            r.blocking_session_id AS BlockingSessionID,
+                            r.session_id AS BlockedSessionID,
+                            DB_NAME(r.database_id) AS DatabaseName,
+                            CASE 
+                                WHEN r.wait_resource LIKE 'OBJECT:%' THEN 
+                                    OBJECT_NAME(CAST(PARSENAME(r.wait_resource, 1) AS INT), r.database_id)
+                                ELSE 'N/A'
+                            END AS ObjectName,
+                            r.wait_type,
+                            r.wait_time AS WaitTimeMS,
+                            r.wait_resource,
+                            (SELECT text FROM sys.dm_exec_sql_text(r.sql_handle)) AS BlockedQuery,
+                            (SELECT text FROM sys.dm_exec_sql_text(c.most_recent_sql_handle)) AS BlockingQuery
+                        FROM sys.dm_exec_requests r
+                        LEFT JOIN sys.dm_exec_sessions s ON r.blocking_session_id = s.session_id
+                        LEFT JOIN sys.dm_exec_connections c ON s.session_id = c.session_id
+                        WHERE r.blocking_session_id <> 0;
+"@
+                        try {
+                            $blockingSessions = Invoke-Sqlcmd -ServerInstance $ServerName -Database "master" -Query $blockingQuery -TrustServerCertificate -ErrorAction Stop
+                            if ($blockingSessions) {
+                                Write-Host "Current blocking sessions detected on {$ServerName}:"
+                                $blockingSessions | ForEach-Object {
+                                    Write-Host "Blocking Session ID: $($_.BlockingSessionID), Blocked Session ID: $($_.BlockedSessionID)"
+                                    Write-Host "Database: $($_.DatabaseName), Object: $($_.ObjectName)"
+                                    Write-Host "Wait Type: $($_.wait_type), Wait Time: $($_.WaitTimeMS) ms, Wait Resource: $($_.wait_resource)"
+                                    Write-Host "Blocked Query: $($_.BlockedQuery.Substring(0, [Math]::Min(100, $_.BlockedQuery.Length)))..."
+                                    Write-Host "Blocking Query: $($_.BlockingQuery.Substring(0, [Math]::Min(100, $_.BlockingQuery.Length)))..."
+                                    Write-Host "---"
+                                }
+                            } else {
+                                Write-Host "No blocking sessions detected on $ServerName."
+                            }
+                        } catch {
+                            Write-Host "[$ServerName] Error: Failed to check blocking sessions. Error: $($_.Exception.Message)"
+                        }
+                    }
+                }
+                "check performance issues" {
+                    foreach ($ServerName in $ServerList) {
+                        Write-Host "`nChecking performance issues on $ServerName..."
+                        $longRunningQuery = @"
+                        SELECT 
+                            r.session_id,
+                            DB_NAME(r.database_id) AS database_name,
+                            r.status,
+                            r.command,
+                            r.wait_type,
+                            r.wait_time AS wait_time_ms,
+                            r.cpu_time AS cpu_time_ms,
+                            r.total_elapsed_time AS elapsed_time_ms,
+                            (SELECT text FROM sys.dm_exec_sql_text(r.sql_handle)) AS query_text
+                        FROM sys.dm_exec_requests r
+                        JOIN sys.dm_exec_sessions s ON r.session_id = s.session_id
+                        WHERE s.is_user_process = 1
+                        AND r.total_elapsed_time > 5000  -- More than 5 seconds
+                        ORDER BY r.total_elapsed_time DESC;
+"@
+                        $script:alerts = @()  # Reset alerts for this server
+                        Check-Performance -ServerName $ServerName
+                        if ($script:alerts.Count -gt 0) {
+                           $message = "`n[$ServerName] Performance Issues at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'):"
+                            Write-Host $message 
+                            Add-content -path $interactiveLogFile -value $message
+
+                            $script:alerts | ForEach-Object { 
+                            Write-Host "- $_" }
+                            Add-Content -path $inetractiveLogFile -Value $message
+                            }
+                        } else {
+                            $message = "[$ServerName] No performance issues detected."
+                            Write-Host $message
+                            Add-Content -Path $interactiveLogFile -Value $message
+                        }
+                    }
+                }
+                "exit" { break }
+                default { 
+                $message = "Unknown command. Try 'what is the missing index?', 'show recent logins', 'check deadlocks', 'check blocking', 'check performance issues','Select Servers' or 'exit'." 
+                Write-Host $message
+                Add-Content -Path $interactiveLogFile -Value $message
+                }
+            }
+        }
+    } else {
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        $agentLogFile = "$logDir/SQLGuardian_Agent_$($ServerName)_$(get-date -format 'yyyyMMdd_HHmmss').log"
+        $logmessage = "SQL Guardian Monitoring started at $timestamp for servers: $($ServerList -join ', ')"
+        Write-Host $logmessage
+        Add-Content -path $agentLogFile -Value "`nMonitoring $serverName..."
+        $script:alerts = @()
+        foreach ($ServerName in $ServerList) {
+            #Write-Host "`nMonitoring $ServerName..."
+            #$script:alerts = @()  # Reset alerts for each server
+            Check-FailedLogins -ServerName $ServerName -TimeWindowMinutes 15
+            Check-EncryptionStatus -ServerName $ServerName
+            Check-Performance -ServerName $ServerName
+
+            # Python anomaly detection
+            $pythonScript = @"
+import pandas as pd
+import pickle
+from sklearn.ensemble import IsolationForest
+import os
+
+# Load data
+os.makedirs('\\boodata\DepartmentShares\EDS\DBA\Wondi\AuditLogs', exist_ok=True)
+os.makedirs('\\boodata\DepartmentShares\EDS\DBA\Wondi\Models', exist_ok=True)
+data = pd.read_csv('\\boodata\DepartmentShares\EDS\DBA\Wondi\AuditLogs/FailedLogins_$ServerName.csv')
+
+# Ensure consistent timestamp parsing
+data['Timestamp'] = pd.to_datetime(data['Timestamp'], format='mixed', errors='coerce')
+data = data.dropna(subset=['Timestamp'])
+data = data.drop_duplicates(subset=['Timestamp', 'User', 'ServerName'])
+
+# Calculate cutoff
+now = pd.Timestamp.now()
+cutoff = now - pd.Timedelta(minutes=15)
+print(f'Current time: {now}')
+print(f'Cutoff time: {cutoff}')
+
+# Filter recent logins
+recent_logins = data[data['Timestamp'] > cutoff].copy()
+print(f'Recent rows (within 15 minutes): {len(recent_logins)}')
+if len(recent_logins) > 0:
+    print('Recent logins found:')
+    print(recent_logins[['Timestamp', 'User']].to_string(index=False))
+else:
+    print('No recent logins detected within the last 15 minutes.')
+    exit()
+
+# Feature engineering
+recent_logins.loc[:, 'Hour'] = recent_logins['Timestamp'].dt.hour
+recent_logins.loc[:, 'DayOfWeek'] = recent_logins['Timestamp'].dt.dayofweek
+
+# Calculate login frequency (average seconds between consecutive attempts per user)
+recent_logins = recent_logins.sort_values(['User', 'Timestamp'])
+recent_logins['TimeDiff'] = recent_logins.groupby('User')['Timestamp'].diff().dt.total_seconds()
+recent_logins['TimeDiff'] = recent_logins['TimeDiff'].fillna(900)  # Default to 15 minutes (900 seconds) if first attempt
+avg_time_diff = recent_logins.groupby(['ServerName', 'User'])['TimeDiff'].mean().reset_index(name='AvgTimeBetweenLogins')
+
+# Count logins per user
+login_counts = (recent_logins.groupby(['ServerName', 'User', 'Hour', 'DayOfWeek'])
+               .size()
+               .reset_index(name='LoginCount'))
+
+# Merge features
+features = login_counts.merge(avg_time_diff, on=['ServerName', 'User'], how='left')
+X = features[['Hour', 'DayOfWeek', 'LoginCount', 'AvgTimeBetweenLogins']].copy()
+
+print(f'Features rows: {len(features)}')
+print('Feature data:')
+print(features.to_string(index=False))
+
+# Load model and predict
+with open('D:/Models/login_anomaly_model.pkl', 'rb') as f:
+    model = pickle.load(f)
+model.set_params(contamination=0.05)
+predictions = model.predict(X)
+print(f'Predictions: {predictions}')
+
+# Check for anomalies
+if -1 in predictions:
+    anomaly_idx = predictions.tolist().index(-1)
+    anomaly_data = features.iloc[anomaly_idx]
+    print(f'Anomaly detected: {anomaly_data["ServerName"]}, {anomaly_data["User"]}, {anomaly_data["LoginCount"]} logins, Avg time between logins: {anomaly_data["AvgTimeBetweenLogins"]} seconds')
+else:
+    print('No anomalies detected.')
+"@
+            $tempFile = "\\boodata\DepartmentShares\EDS\DBA\Wondi\AuditLogs\LastPythonScript_$ServerName.py"
+            [System.IO.File]::WriteAllText($tempFile, $pythonScript, [System.Text.Encoding]::UTF8)
+            Write-Host "[$ServerName] Debug: Python script saved to $tempFile"
+
+            $anomalies = Invoke-PythonScript -Script $pythonScript -ServerName $ServerName
+            if ($anomalies) {
+                foreach ($anomaly in $anomalies) {
+                    if ($anomaly -match "Anomaly detected") {
+                        $script:alerts += "[$ServerName] Anomaly Alert: $anomaly"
+                    } elseif ($anomaly -match "No recent failed logins") {
+                        $script:alerts += "[$ServerName] Info: $anomaly"
+                    } else {
+                        $script:alerts += "[$ServerName] Debug: $anomaly"
+                    }
+                }
+            } else {
+                Write-Host "[$ServerName] No anomalies detected by model."
+            }
+
+            # Handle alerts for this server
+            $logFilePath = "\\boodata\DepartmentShares\EDS\DBA\Wondi\AuditLogs\SQLGuardian_$ServerName.log"
+            $logDir = Split-Path $logFilePath -Parent
+            if (-not (Test-Path $logDir)) {
+                New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+            }
+            if ($script:alerts.Count -gt 0) {
+                Write-Host "`n[$ServerName] Alerts at ${timestamp}:"
+                $script:alerts | ForEach-Object { Write-Host "- $_" }
+                $logEntry = "[$timestamp] [$ServerName] Alerts:`n" + ($script:alerts -join "`n") + "`n"
+                Add-Content -Path $logFilePath -Value $logEntry
+
+                if (-not $smtpServer -or -not $smtpPort -or -not $smtpUsername -or -not $smtpPassword -or -not $emailTo -or -not $emailFrom) {
+                    Write-Host "[$ServerName] Error: Missing SMTP configuration. Check smtpServer, smtpPort, smtpUsername, smtpPassword, emailTo, or emailFrom."
+                } else {
+                    try {
+                        $smtpCred = New-Object System.Management.Automation.PSCredential ($smtpUsername, (ConvertTo-SecureString $smtpPassword -AsPlainText -Force))
+                        Send-MailMessage -To $emailTo -From $emailFrom `
+                            -Subject "SQL Guardian Alerts for $ServerName at $timestamp" `
+                            -Body ($script:alerts -join "`n") `
+                            -SmtpServer $smtpServer -Port $smtpPort `
+                            -Credential $smtpCred -UseSsl
+                        $message = "[$ServerName] Email sent successfully to $emailTo."
+                        write-host $message
+                       Add-Content -path $agentLogFile -Value $message
+                    } catch {
+                        $message =  "[$ServerName] Failed to send email: $_"
+                        write-host $message
+                       Add-Content -path $agentLogFile -Value $message
+                    }
+                }
+            } else {
+                $message = "[$ServerName] No security or performance issues detected at ${timestamp}."
+                write-host Write-Host
+                Add-Content -path $agentLogFile -Value $message
+            }
+        }
+    }
+
+
+# Execute based on mode
+if ($Interactive) {
+    Start-SQLGuardian -Interactive
+} else {
+    Start-SQLGuardian
+}
